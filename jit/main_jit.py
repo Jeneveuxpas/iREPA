@@ -27,6 +27,7 @@ from projectors import ALL_PROJECTION_LAYER_TYPES
 from spnorm import ALL_SPNORM_METHODS
 from vision_encoder import load_encoders
 from spnorm import SpatialNormalization
+from encoder_adapter import EncoderKVExtractor
 
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
@@ -151,6 +152,19 @@ def get_args_parser():
     parser.add_argument("--cls_token_weight", type=float, default=0.2)
     parser.add_argument("--zscore_alpha", type=float, default=0.8)
     parser.add_argument("--zscore_proj_skip_std", action=argparse.BooleanOptionalAction, default=False)
+
+    # AttnScaf: temporary encoder K/V scaffold followed by output consistency.
+    parser.add_argument("--enable_attnscaf", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--attnscaf_layer", type=int, default=4,
+                        help="1-based JiT block receiving the temporary encoder K/V scaffold")
+    parser.add_argument("--attnscaf_enc_layer", type=int, default=12,
+                        help="1-based DINO attention layer from which native K/V are captured")
+    parser.add_argument("--attnscaf_kv_proj", choices=["linear", "mlp"], default="linear")
+    parser.add_argument("--attnscaf_kv_norm", choices=["none", "layer"], default="none")
+    parser.add_argument("--stage1_steps", type=int, default=30000)
+    parser.add_argument("--transition_steps", type=int, default=0,
+                        help="Optional cosine handoff; 0 matches the DiT two-stage implementation")
+    parser.add_argument("--distill_coeff", type=float, default=2.0)
 
     # config file (YAML)
     parser.add_argument("--config", type=str, default=None,
@@ -296,7 +310,7 @@ def main(args):
     torch._dynamo.config.optimize_ddp = False
 
     # Prepare REPA kwargs
-    if args.enable_repa:
+    if args.enable_repa or args.enable_attnscaf:
         encoders = load_encoders(
             args.enc_type, device, args.img_size
         )
@@ -307,9 +321,17 @@ def main(args):
             "cls_token_weight": args.cls_token_weight,
             "zscore_alpha": args.zscore_alpha,
             "zscore_proj_skip_std": args.zscore_proj_skip_std,
+            "kv_extractor": None,
         }
         # If the script is run for saving generation or evaluation, we don't load the projectors
-        args.z_dims = [encoder.embed_dim for encoder in encoders] if not args.evaluate_gen else []
+        args.z_dims = [encoder.embed_dim for encoder in encoders] if (args.enable_repa and not args.evaluate_gen) else []
+        args.scaffold_dim = encoders[0].embed_dim if (args.enable_attnscaf and not args.evaluate_gen) else 0
+        args.scaffold_heads = 0
+        if args.enable_attnscaf and not args.evaluate_gen:
+            encoder_model = encoders[0].model
+            layer_index = args.attnscaf_enc_layer - 1
+            repa_kwargs["kv_extractor"] = EncoderKVExtractor(encoder_model, [layer_index])
+            args.scaffold_heads = encoder_model.blocks[layer_index].attn.num_heads
         print("Z dims:", args.z_dims)
     else:
         repa_kwargs = {
@@ -318,8 +340,11 @@ def main(args):
             "cls_token_weight": 0.0,
             "zscore_alpha": 1.0,
             "zscore_proj_skip_std": False,
+            "kv_extractor": None,
         }
         args.z_dims = []
+        args.scaffold_dim = 0
+        args.scaffold_heads = 0
 
     # Create denoiser
     model = Denoiser(args)

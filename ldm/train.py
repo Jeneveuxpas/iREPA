@@ -150,6 +150,7 @@ def main(args):
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
+    model_orig = model  # keep a direct reference before compile/prepare wrap it
 
     # Load the VAE weights correctly, load the BN stats
     vae = VAE_F8D4().to(device).eval()
@@ -345,12 +346,7 @@ def main(args):
                 optim_step_fn()
 
                 if accelerator.sync_gradients and global_step % args.ema_update_freq == 0:
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    update_ema(
-                        ema,
-                        unwrapped_model._orig_mod if args.compile else unwrapped_model,
-                        decay=args.ema_decay
-                    )
+                    update_ema(ema, model_orig, decay=args.ema_decay)
             
             ### enter
             if accelerator.sync_gradients:
@@ -358,11 +354,8 @@ def main(args):
                 global_step += 1                
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
                 if accelerator.is_main_process:
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    original_model = unwrapped_model._orig_mod if args.compile else unwrapped_model
-
                     checkpoint = {
-                        "model": original_model.state_dict(),
+                        "model": model_orig.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
                         "args": args,

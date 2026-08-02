@@ -26,6 +26,7 @@ def train_one_epoch(
     cls_token_weight = repa_kwargs.get('cls_token_weight', 0.2)
     zscore_alpha = repa_kwargs.get('zscore_alpha', 0.6)
     zscore_proj_skip_std = repa_kwargs.get('zscore_proj_skip_std', False)
+    kv_extractor = repa_kwargs.get('kv_extractor', None)
 
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -47,6 +48,7 @@ def train_one_epoch(
         # Prepare zs for projection loss
         with torch.no_grad():
             zs = []
+            enc_kv_list = None
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 for encoder in encoders:
                     # Preprocess the image using encoder's built-in method
@@ -55,7 +57,11 @@ def train_one_epoch(
 
                     # Encode the features
                     # outputs dictionary with keys: 'x_norm_patchtokens' and 'x_norm_clstoken'
+                    if kv_extractor is not None and enc_kv_list is None:
+                        kv_extractor.reset()
                     features = encoder.forward_features(raw_image_)
+                    if kv_extractor is not None and enc_kv_list is None:
+                        enc_kv_list = kv_extractor.captured()
 
                     # normalize spatial features
                     spnorm_kwargs = {
@@ -76,7 +82,11 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss, loss_dict = model(x, labels, zs)
+            global_step = epoch * len(data_loader) + data_iter_step
+            loss, loss_dict = model(
+                x, labels, zs, enc_kv_list=enc_kv_list,
+                global_step=global_step,
+            )
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):

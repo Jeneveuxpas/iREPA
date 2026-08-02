@@ -9,6 +9,7 @@ import math
 import torch.nn.functional as F
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
 from projectors import ProjectionLayer
+from encoder_adapter import EncoderKVProjection
 
 
 def modulate(x, shift, scale):
@@ -119,7 +120,8 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, rope):
+    def forward(self, x, rope, scaffold_k=None, scaffold_v=None,
+                scaffold_alpha=1.0, distill_scaffold=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
@@ -130,13 +132,37 @@ class Attention(nn.Module):
         q = rope(q)
         k = rope(k)
 
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        native_x = scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.
+        )
+        distill_loss = None
+        if scaffold_k is not None and scaffold_v is not None and self.training:
+            scaffold_x = scaled_dot_product_attention(
+                q, scaffold_k, scaffold_v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+            alpha = torch.as_tensor(
+                scaffold_alpha, device=native_x.device, dtype=native_x.dtype
+            )
+            if distill_scaffold:
+                x = native_x
+                # Match DiT's stage-2 target: native Q is detached on the
+                # teacher branch. The zero term keeps projection parameters in
+                # DDP's graph while intentionally giving them zero gradient.
+                distill_loss = (
+                    F.mse_loss(native_x.float(), scaffold_x.detach().float())
+                    + 0.0 * (scaffold_k.sum() + scaffold_v.sum())
+                )
+            else:
+                x = (1.0 - alpha) * scaffold_x + alpha * native_x
+        else:
+            x = native_x
 
         x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x, distill_loss
 
 
 class SwiGLUFFN(nn.Module):
@@ -182,7 +208,8 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0,
+                 proj_drop=0.0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
@@ -196,11 +223,17 @@ class JiTBlock(nn.Module):
         )
 
     @torch.compile
-    def forward(self, x,  c, feat_rope=None):
+    def forward(self, x, c, feat_rope=None, scaffold_k=None, scaffold_v=None,
+                scaffold_alpha=1.0, distill_scaffold=False):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        attn_out, distill_loss = self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope,
+            scaffold_k=scaffold_k, scaffold_v=scaffold_v,
+            scaffold_alpha=scaffold_alpha, distill_scaffold=distill_scaffold,
+        )
+        x = x + gate_msa.unsqueeze(1) * attn_out
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
+        return x, distill_loss
 
 
 class JiT(nn.Module):
@@ -227,6 +260,11 @@ class JiT(nn.Module):
         projector_dim=2048,
         projection_layer_type="mlp",
         proj_kwargs_kernel_size=3,
+        attnscaf_layer=0,
+        scaffold_dim=0,
+        scaffold_heads=0,
+        scaffold_kv_proj="linear",
+        scaffold_kv_norm="none",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -244,6 +282,7 @@ class JiT(nn.Module):
         self.projector_dim = projector_dim
         self.proj_kwargs_kernel_size = proj_kwargs_kernel_size
         self.projection_layer_type = projection_layer_type
+        self.attnscaf_layer = attnscaf_layer
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -282,6 +321,13 @@ class JiT(nn.Module):
                      proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
             for i in range(depth)
         ])
+
+        self.scaffold_projection = None
+        if attnscaf_layer > 0:
+            self.scaffold_projection = EncoderKVProjection(
+                enc_dim=scaffold_dim, jit_dim=hidden_size, jit_heads=num_heads,
+                num_layers=1, proj_type=scaffold_kv_proj, norm_type=scaffold_kv_norm,
+            )
 
         if len(z_dims) > 0:
             self.projectors = nn.ModuleList([
@@ -347,7 +393,8 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, enc_kv_list=None, scaffold_alpha=1.0,
+                distill_scaffold=False):
         """
         x: (N, C, H, W)
         t: (N,)
@@ -364,13 +411,30 @@ class JiT(nn.Module):
 
         zs_tilde = None
         zs_tilde_original = None
+        distill_loss = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        projected_kv = None
+        if enc_kv_list is not None and self.scaffold_projection is not None:
+            projected_kv = self.scaffold_projection(enc_kv_list, self.x_embedder.num_patches)
         for i, block in enumerate(self.blocks):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
                 x = torch.cat([in_context_tokens, x], dim=1)
-            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
+            block_k = block_v = None
+            if projected_kv is not None and (i + 1) == self.attnscaf_layer:
+                block_k, block_v = projected_kv[0]
+            if block_k is not None and x.shape[1] != block_k.shape[2]:
+                raise ValueError(
+                    "AttnScaf must be injected before JiT in-context tokens are inserted"
+                )
+            x, block_distill = block(
+                x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext,
+                scaffold_k=block_k, scaffold_v=block_v, scaffold_alpha=scaffold_alpha,
+                distill_scaffold=distill_scaffold,
+            )
+            if block_distill is not None:
+                distill_loss = distill_loss + block_distill
 
             if self.projectors is not None and (i + 1) == self.encoder_depth:
                 # REPA only aligns the patch tokens, skip the in-context tokens in the front
@@ -386,7 +450,7 @@ class JiT(nn.Module):
         x = self.final_layer(x, c)
         output = self.unpatchify(x, self.patch_size)
 
-        return output, zs_tilde, zs_tilde_original
+        return output, zs_tilde, zs_tilde_original, distill_loss
 
 
 def JiT_B_16(**kwargs):

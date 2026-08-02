@@ -1,0 +1,61 @@
+# Custom iREPA/LDM configuration generated from the provided settings.
+# Usage: accelerate launch train.py --config configs/sit-xl-2-sdvae-dinov2-b-enc8-cosine1.0-spmethod-zscore-zalpha0.6-projlayer-convkernel3.yaml
+# Note: current ldm/train.py ignores these bookkeeping-only keys:
+# sync_checkpoints, vae, vae_ckpt, vae_latents_name, imagenet_dir,
+# vis_enc_resolution, symmetric, tau, negatives, bef_proj,
+# remove_diag, instancenorm
+
+output_dir: exps
+exp_name: irepa
+logging_dir: logs
+report_to: wandb
+sampling_steps: 50000
+resume_step: 400000
+n_samples: 64
+sync_checkpoints: false
+model: "SiT-XL/2"
+num_classes: 1000
+encoder_depth: 8
+fused_attn: true
+qk_norm: false
+projection_layer_type: conv
+proj_kwargs_kernel_size: 3
+data_dir: /dev/shm/data
+imagenet_dir: data
+resolution: 256
+batch_size: 256
+vis_enc_resolution: 256
+allow_tf32: true
+mixed_precision: bf16
+epochs: 1400
+max_train_steps: 1000000
+checkpointing_steps: 50000
+gradient_accumulation_steps: 1
+learning_rate: 0.0001
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.0
+adam_epsilon: 1.0e-08
+max_grad_norm: 1.0
+compile: true
+ema_decay: 0.9999
+ema_update_freq: 1
+seed: 0
+num_workers: 18
+path_type: linear
+prediction: v
+cfg_prob: 0.1
+enc_type: dinov2-vit-b
+proj_coeff: "1.0"
+weighting: uniform
+repa_loss: true
+projection_loss_type: cosine
+spnorm_method: zscore
+cls_token_weight: 0.2
+zscore_alpha: 0.6
+symmetric: true
+tau: 0.5
+negatives: intra
+bef_proj: false
+remove_diag: true
+instancenorm: false

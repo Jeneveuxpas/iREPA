@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 from model_jit import JiT_models
 import projection_loss as pl
 
@@ -21,6 +22,11 @@ class Denoiser(nn.Module):
             projector_dim=args.projector_dim,
             projection_layer_type=args.projection_layer_type,
             proj_kwargs_kernel_size=args.proj_kwargs_kernel_size,
+            attnscaf_layer=args.attnscaf_layer if args.enable_attnscaf else 0,
+            scaffold_dim=args.scaffold_dim if args.enable_attnscaf else 0,
+            scaffold_heads=args.scaffold_heads if args.enable_attnscaf else 0,
+            scaffold_kv_proj=args.attnscaf_kv_proj,
+            scaffold_kv_norm=args.attnscaf_kv_norm,
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num
@@ -30,6 +36,10 @@ class Denoiser(nn.Module):
         self.P_std = args.P_std
         self.t_eps = args.t_eps
         self.noise_scale = args.noise_scale
+        self.enable_attnscaf = args.enable_attnscaf
+        self.stage1_steps = args.stage1_steps
+        self.transition_steps = args.transition_steps
+        self.distill_coeff = args.distill_coeff
 
         # ema
         self.ema_decay1 = args.ema_decay1
@@ -67,7 +77,7 @@ class Denoiser(nn.Module):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
-    def forward(self, x, labels, zs):
+    def forward(self, x, labels, zs, enc_kv_list=None, global_step=0):
         labels_dropped = self.drop_labels(labels) if self.training else labels
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
@@ -76,7 +86,22 @@ class Denoiser(nn.Module):
         z = t * x + (1 - t) * e
         v = (x - z) / (1 - t).clamp_min(self.t_eps)
 
-        x_pred, zs_tilde, zs_tilde_original = self.net(z, t.flatten(), labels_dropped)
+        scaffold_alpha = 1.0
+        distill_scaffold = False
+        if self.enable_attnscaf and enc_kv_list is not None:
+            transition_start = max(0, self.stage1_steps - self.transition_steps)
+            if global_step < transition_start:
+                scaffold_alpha = 0.0
+            elif global_step < self.stage1_steps and self.transition_steps > 0:
+                progress = (global_step - transition_start) / self.transition_steps
+                scaffold_alpha = 0.5 - 0.5 * math.cos(math.pi * progress)
+            else:
+                distill_scaffold = True
+        x_pred, zs_tilde, zs_tilde_original, distill_loss = self.net(
+            z, t.flatten(), labels_dropped,
+            enc_kv_list=enc_kv_list if self.enable_attnscaf else None,
+            scaffold_alpha=scaffold_alpha, distill_scaffold=distill_scaffold,
+        )
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
         # l2 loss
@@ -109,6 +134,10 @@ class Denoiser(nn.Module):
             loss_dict['total_proj_loss'] = total_proj_loss.detach().item()
 
         loss = loss + total_proj_loss
+        weighted_distill = self.distill_coeff * distill_loss if distill_scaffold else distill_loss * 0.0
+        loss = loss + weighted_distill
+        loss_dict['attnscaf_distill_loss'] = distill_loss.detach().item()
+        loss_dict['attnscaf_distill_weighted'] = weighted_distill.detach().item()
         loss_dict['total_loss'] = loss.detach().item()
 
         return loss, loss_dict
@@ -169,7 +198,7 @@ class Denoiser(nn.Module):
         # --- PATH A: Standard Execution (No CFG) ---
         # 50% faster than the original code when active
         if not is_guidance_active:
-            x_cond, _, _ = self.net(z, t.flatten(), labels)
+            x_cond, _, _, _ = self.net(z, t.flatten(), labels)
             return (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
 
         # --- PATH B: CFG Execution (Batched) ---
@@ -182,7 +211,7 @@ class Denoiser(nn.Module):
         c_in = torch.cat([labels, null_labels])
 
         # Single forward pass
-        x_out, _, _ = self.net(z_in, t_in.flatten(), c_in)
+        x_out, _, _, _ = self.net(z_in, t_in.flatten(), c_in)
         x_cond, x_uncond = x_out.chunk(2)
 
         # Apply CFG directly to x space (Optimization: calculate velocity once)

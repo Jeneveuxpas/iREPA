@@ -1,0 +1,23 @@
+# iREPA + AttnScaf. Native K/V from DINO attention layer 12 are projected and
+# used as temporary memory at JiT block 4, then handed off to native attention.
+enable_repa: true
+enable_attnscaf: true
+enc_type: dinov2-vit-b
+
+projection_layer_type: mlp
+projection_loss_type: cosine
+proj_coeff: "0.5"
+spnorm_method: none
+zscore_alpha: 0.6
+epochs: 20
+
+# 0--30k: encoder K/V; >=30k: native attention plus attention-output
+# consistency loss (the same two-stage boundary as DiT).
+encoder_depth: 6 
+attnscaf_layer: 4
+attnscaf_enc_layer: 12
+attnscaf_kv_proj: linear
+attnscaf_kv_norm: none
+stage1_steps: 30000
+transition_steps: 5000
+distill_coeff: 2.0

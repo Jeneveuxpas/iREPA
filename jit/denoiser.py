@@ -111,6 +111,7 @@ class Denoiser(nn.Module):
         # Projection loss
         total_proj_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         loss_dict = {}
+        loss_dict['denoise_loss'] = loss.detach().item()
         if zs and zs_tilde and zs_tilde_original:
             assert len(zs) == len(zs_tilde) == len(zs_tilde_original), \
                 f"Shape mismatch: {len(zs)=} vs {len(zs_tilde)=} vs {len(zs_tilde_original)=}"
@@ -121,18 +122,14 @@ class Denoiser(nn.Module):
                 if len(zs) > 0 and len(zs_tilde) > 0:
                     # loop across different encoders
                     for z_target, z_tilde, z_tilde_original in zip(zs, zs_tilde, zs_tilde_original):
+                        # zs_tilde_original will be only used for gram-matrix loss, so its shape doesn't matter
                         assert z_target.shape == z_tilde.shape, f"Shape mismatch: {z_target.shape=} vs {z_tilde.shape=}"
                         proj_loss = proj_loss + proj_loss_fn(z_target, z_tilde, z_tilde_original)
-                        # zs_tilde_original will be only used for gram-matrix loss, so its shape doesn't matter
-                        assert z.shape == z_tilde.shape, f"Shape mismatch: {z.shape=} vs {z_tilde.shape=}"
-                        # NOTE: We pass vision_feats, projected_sit_feats, and unprojected_sit_feats, but the last one might not be used
-                        proj_loss = proj_loss + proj_loss_fn(z, z_tilde, z_tilde_original)
                     proj_loss /= len(zs)
                 loss_dict[proj_loss_name] = proj_loss.detach().item()
                 loss_dict[f"{proj_loss_name}_weighted"] = proj_loss.detach().item() * coeff
                 total_proj_loss = total_proj_loss + coeff * proj_loss
 
-            loss_dict['denoise_loss'] = loss.detach().item()
             loss_dict['total_proj_loss'] = total_proj_loss.detach().item()
 
         loss = loss + total_proj_loss

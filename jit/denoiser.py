@@ -120,7 +120,9 @@ class Denoiser(nn.Module):
                 proj_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
                 if len(zs) > 0 and len(zs_tilde) > 0:
                     # loop across different encoders
-                    for z, z_tilde, z_tilde_original in zip(zs, zs_tilde, zs_tilde_original):
+                    for z_target, z_tilde, z_tilde_original in zip(zs, zs_tilde, zs_tilde_original):
+                        assert z_target.shape == z_tilde.shape, f"Shape mismatch: {z_target.shape=} vs {z_tilde.shape=}"
+                        proj_loss = proj_loss + proj_loss_fn(z_target, z_tilde, z_tilde_original)
                         # zs_tilde_original will be only used for gram-matrix loss, so its shape doesn't matter
                         assert z.shape == z_tilde.shape, f"Shape mismatch: {z.shape=} vs {z_tilde.shape=}"
                         # NOTE: We pass vision_feats, projected_sit_feats, and unprojected_sit_feats, but the last one might not be used

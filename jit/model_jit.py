@@ -124,42 +124,46 @@ class Attention(nn.Module):
                 scaffold_alpha=1.0, distill_scaffold=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = self.q_norm(q)
-        k = self.k_norm(k)
+        k = self.k_norm(k)          # k: post-norm, pre-RoPE
 
-        q = rope(q)
-        k = rope(k)
+        q_rope = rope(q)
+        k_rope = rope(k)
 
         native_x = scaled_dot_product_attention(
-            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.
+            q_rope, k_rope, v, dropout_p=self.attn_drop.p if self.training else 0.
         )
+
         distill_loss = None
         if scaffold_k is not None and scaffold_v is not None and self.training:
-            scaffold_x = scaled_dot_product_attention(
-                q, scaffold_k, scaffold_v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
-            alpha = torch.as_tensor(
-                scaffold_alpha, device=native_x.device, dtype=native_x.dtype
-            )
+            # Put the injected keys through the same normalization and the same
+            # positional rotation as the native keys, so that both branches are
+            # compared under identical scale and identical relative geometry.
+            s_k = self.k_norm(scaffold_k)
+            s_k_rope = rope(s_k)
+
             if distill_scaffold:
                 x = native_x
-                # Match DiT's stage-2 target: native Q is detached on the
-                # teacher branch. The zero term keeps projection parameters in
-                # DDP's graph while intentionally giving them zero gradient.
                 distill_loss = (
-                    F.mse_loss(native_x.float(), scaffold_x.detach().float())
+                    F.mse_loss(k.float(), s_k.detach().float())
+                    + F.mse_loss(v.float(), scaffold_v.detach().float())
                     + 0.0 * (scaffold_k.sum() + scaffold_v.sum())
                 )
             else:
+                scaffold_x = scaled_dot_product_attention(
+                    q_rope, s_k_rope, scaffold_v,
+                    dropout_p=self.attn_drop.p if self.training else 0.,
+                )
+                alpha = torch.as_tensor(
+                    scaffold_alpha, device=native_x.device, dtype=native_x.dtype
+                )
                 x = (1.0 - alpha) * scaffold_x + alpha * native_x
         else:
             x = native_x
 
         x = x.transpose(1, 2).reshape(B, N, C)
-
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, distill_loss

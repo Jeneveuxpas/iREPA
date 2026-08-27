@@ -9,7 +9,7 @@ enable_attnscaf: true
 enc_type: dinov2-vit-b
 
 # JiT-B inserts in-context tokens before block 5, so scaffold block 4.
-attnscaf_layer: 6
+attnscaf_layer: 4
 attnscaf_enc_layer: 12
 attnscaf_kv_proj: linear
 attnscaf_kv_norm: none

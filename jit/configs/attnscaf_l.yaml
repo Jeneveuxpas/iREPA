@@ -13,6 +13,9 @@ projection_loss_type: cosine
 proj_coeff: "0.0"
 spnorm_method: none
 zscore_alpha: 0.6
+# Effective batch is batch_size * world_size, and lr = blr * eff_batch / 256.
+# Pin the batch and let max_train_steps determine the training length.
+batch_size: 128        # 2 GPUs -> effective batch 256, lr 5e-5
 epochs: 200
 max_train_steps: 100000
 
@@ -26,4 +29,3 @@ stage1_steps: 20000
 transition_steps: 0
 distill_coeff: 2.0
 attnscaf_loss_type: kv_mse
-

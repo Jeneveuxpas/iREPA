@@ -138,6 +138,14 @@ class Denoiser(nn.Module):
         weighted_distill = self.distill_coeff * distill_loss if distill_scaffold else distill_loss * 0.0
         loss = loss + weighted_distill
         loss_dict['attnscaf_distill_loss'] = distill_loss.detach().item()
+        if self.enable_attnscaf and self.net.attnscaf_layer > 0:
+            # A falling shared K RMSNorm gain can lower kv_mse without better
+            # directional alignment, so expose it as a training diagnostic.
+            with torch.no_grad():
+                k_norm_w = self.net.blocks[
+                    self.net.attnscaf_layer - 1
+                ].attn.k_norm.weight
+                loss_dict['attnscaf_knorm_gain'] = float(k_norm_w.abs().mean())
         loss_dict['attnscaf_distill_weighted'] = weighted_distill.detach().item()
         loss_dict['total_loss'] = loss.detach().item()
 

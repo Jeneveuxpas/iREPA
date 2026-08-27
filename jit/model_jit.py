@@ -95,10 +95,14 @@ class LabelEmbedder(nn.Module):
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return (attn_weight @ value.float()).to(value.dtype)
+    # Autocast would otherwise downcast these matmuls despite the explicit
+    # float conversions. Keep the original JiT attention computation in fp32.
+    with torch.cuda.amp.autocast(enabled=False):
+        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+        out = attn_weight @ value.float()
+    return out.to(value.dtype)
 
 
 class Attention(nn.Module):
@@ -138,7 +142,6 @@ class Attention(nn.Module):
             # positional rotation as the native keys, so that both branches are
             # compared under identical scale and identical relative geometry.
             s_k = self.k_norm(scaffold_k)
-            s_k_rope = rope(s_k)
 
             if distill_scaffold:
                 x = native_x
@@ -167,7 +170,7 @@ class Attention(nn.Module):
                 )
             else:
                 scaffold_x = scaled_dot_product_attention(
-                    q_rope, s_k_rope, scaffold_v,
+                    q_rope, rope(s_k), scaffold_v,
                     dropout_p=self.attn_drop.p if self.training else 0.,
                 )
                 alpha = torch.as_tensor(

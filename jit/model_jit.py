@@ -94,16 +94,11 @@ class LabelEmbedder(nn.Module):
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
-
-    with torch.cuda.amp.autocast(enabled=False):
-        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
+    attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
+    return (attn_weight @ value.float()).to(value.dtype)
 
 
 class Attention(nn.Module):
@@ -121,7 +116,8 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, rope, scaffold_k=None, scaffold_v=None,
-                scaffold_alpha=1.0, distill_scaffold=False):
+                scaffold_alpha=1.0, distill_scaffold=False,
+                scaffold_loss_type="kv_mse"):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -146,10 +142,28 @@ class Attention(nn.Module):
 
             if distill_scaffold:
                 x = native_x
-                distill_loss = (
-                    F.mse_loss(k.float(), s_k.detach().float())
-                    + F.mse_loss(v.float(), scaffold_v.detach().float())
-                    + 0.0 * (scaffold_k.sum() + scaffold_v.sum())
+                if scaffold_loss_type == "kv_mse":
+                    distill_loss = (
+                        F.mse_loss(k.float(), s_k.detach().float())
+                        + F.mse_loss(v.float(), scaffold_v.detach().float())
+                    )
+                elif scaffold_loss_type == "kv_cos":
+                    distill_loss = (
+                        1.0 - F.cosine_similarity(
+                            k.float(), s_k.detach().float(), dim=-1
+                        ).mean()
+                        + 1.0 - F.cosine_similarity(
+                            v.float(), scaffold_v.detach().float(), dim=-1
+                        ).mean()
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown AttnScaf loss type: {scaffold_loss_type}"
+                    )
+                # Keep the training-only projection in the graph under DDP even
+                # though the encoder target must not receive gradients.
+                distill_loss = distill_loss + 0.0 * (
+                    scaffold_k.sum() + scaffold_v.sum()
                 )
             else:
                 scaffold_x = scaled_dot_product_attention(
@@ -228,12 +242,14 @@ class JiTBlock(nn.Module):
 
     @torch.compile
     def forward(self, x, c, feat_rope=None, scaffold_k=None, scaffold_v=None,
-                scaffold_alpha=1.0, distill_scaffold=False):
+                scaffold_alpha=1.0, distill_scaffold=False,
+                scaffold_loss_type="kv_mse"):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         attn_out, distill_loss = self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope,
             scaffold_k=scaffold_k, scaffold_v=scaffold_v,
             scaffold_alpha=scaffold_alpha, distill_scaffold=distill_scaffold,
+            scaffold_loss_type=scaffold_loss_type,
         )
         x = x + gate_msa.unsqueeze(1) * attn_out
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -398,7 +414,7 @@ class JiT(nn.Module):
         return imgs
 
     def forward(self, x, t, y, enc_kv_list=None, scaffold_alpha=1.0,
-                distill_scaffold=False):
+                distill_scaffold=False, scaffold_loss_type="kv_mse"):
         """
         x: (N, C, H, W)
         t: (N,)
@@ -436,6 +452,7 @@ class JiT(nn.Module):
                 x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext,
                 scaffold_k=block_k, scaffold_v=block_v, scaffold_alpha=scaffold_alpha,
                 distill_scaffold=distill_scaffold,
+                scaffold_loss_type=scaffold_loss_type,
             )
             if block_distill is not None:
                 distill_loss = distill_loss + block_distill

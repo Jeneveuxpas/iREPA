@@ -18,7 +18,7 @@ from torchvision.utils import make_grid
 
 def train_one_epoch(
     model, model_without_ddp, data_loader, optimizer, device, epoch, repa_kwargs,
-    log_writer=None, args=None
+    log_writer=None, args=None, global_step=0
 ):
     # REPA kwargs
     encoders = repa_kwargs.get('encoders', [])
@@ -40,6 +40,9 @@ def train_one_epoch(
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        if args.max_train_steps is not None and global_step >= args.max_train_steps:
+            return global_step, True
+
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
@@ -82,7 +85,6 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            global_step = epoch * len(data_loader) + data_iter_step
             loss, loss_dict = model(
                 x, labels, zs, enc_kv_list=enc_kv_list,
                 global_step=global_step,
@@ -100,6 +102,7 @@ def train_one_epoch(
         torch.cuda.synchronize()
 
         model_without_ddp.update_ema()
+        global_step += 1
 
         metric_logger.update(loss=loss_value)
         lr = optimizer.param_groups[0]["lr"]
@@ -127,6 +130,11 @@ def train_one_epoch(
                 for key, value in reduced_loss_dict.items():
                     wandb_logs[f'train/{key}'] = value
                 wandb.log(wandb_logs, step=epoch_1000x)
+
+        if args.max_train_steps is not None and global_step >= args.max_train_steps:
+            return global_step, True
+
+    return global_step, False
 
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):

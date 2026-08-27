@@ -40,6 +40,7 @@ class Denoiser(nn.Module):
         self.stage1_steps = args.stage1_steps
         self.transition_steps = args.transition_steps
         self.distill_coeff = args.distill_coeff
+        self.attnscaf_loss_type = args.attnscaf_loss_type
 
         # ema
         self.ema_decay1 = args.ema_decay1
@@ -101,6 +102,7 @@ class Denoiser(nn.Module):
             z, t.flatten(), labels_dropped,
             enc_kv_list=enc_kv_list if self.enable_attnscaf else None,
             scaffold_alpha=scaffold_alpha, distill_scaffold=distill_scaffold,
+            scaffold_loss_type=self.attnscaf_loss_type,
         )
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 

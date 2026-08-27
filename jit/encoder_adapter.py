@@ -1,4 +1,6 @@
 """DINO attention K/V extraction and projection for AttnScaf."""
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,12 +20,38 @@ class EncoderKVExtractor(nn.Module):
                 raise ValueError(f"DINO layer {idx + 1} is outside 1..{len(blocks)}")
             self._hooks.append(blocks[idx].attn.register_forward_hook(self._hook(idx)))
 
-    def _hook(self, layer_idx):
-        num_prefix = int(getattr(self.encoder, "num_prefix_tokens", 0))
+    def _get_prefix_token_count(self, sequence_length=None):
+        num_prefix_tokens = getattr(self.encoder, "num_prefix_tokens", None)
+        if num_prefix_tokens is None:
+            has_cls_token = getattr(self.encoder, "cls_token", None) is not None
+            num_register_tokens = int(getattr(self.encoder, "num_register_tokens", 0))
+            num_prefix_tokens = int(has_cls_token) + num_register_tokens
+        else:
+            num_prefix_tokens = int(num_prefix_tokens)
 
+        # DINOv2 does not consistently expose num_prefix_tokens. Validate the
+        # metadata against the square patch grid and infer it when necessary.
+        if sequence_length is not None:
+            num_patch_tokens = sequence_length - num_prefix_tokens
+            patch_side = math.isqrt(num_patch_tokens) if num_patch_tokens >= 0 else -1
+            if patch_side < 0 or patch_side * patch_side != num_patch_tokens:
+                for candidate in range(min(32, sequence_length)):
+                    num_patch_tokens = sequence_length - candidate
+                    patch_side = math.isqrt(num_patch_tokens)
+                    if patch_side * patch_side == num_patch_tokens:
+                        num_prefix_tokens = candidate
+                        break
+                else:
+                    raise ValueError(
+                        f"Cannot infer DINO prefix tokens from sequence length {sequence_length}"
+                    )
+        return num_prefix_tokens
+
+    def _hook(self, layer_idx):
         def capture(module, inputs, output):
             x = inputs[0]
             B, N, C = x.shape
+            num_prefix = self._get_prefix_token_count(sequence_length=N)
             qkv = module.qkv(x).reshape(
                 B, N, 3, module.num_heads, C // module.num_heads
             ).permute(2, 0, 3, 1, 4)

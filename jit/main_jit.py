@@ -41,6 +41,8 @@ def get_args_parser():
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('--max_train_steps', default=None, type=int,
+                        help='Maximum optimizer steps, independent of world size')
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='Epochs to warm up LR')
     parser.add_argument('--batch_size', default=128, type=int,
@@ -153,7 +155,7 @@ def get_args_parser():
     parser.add_argument("--zscore_alpha", type=float, default=0.8)
     parser.add_argument("--zscore_proj_skip_std", action=argparse.BooleanOptionalAction, default=False)
 
-    # AttnScaf: temporary encoder K/V scaffold followed by output consistency.
+    # AttnScaf: temporary encoder K/V scaffold followed by K/V alignment.
     parser.add_argument("--enable_attnscaf", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--attnscaf_layer", type=int, default=4,
                         help="1-based JiT block receiving the temporary encoder K/V scaffold")
@@ -165,6 +167,8 @@ def get_args_parser():
     parser.add_argument("--transition_steps", type=int, default=0,
                         help="Optional cosine handoff; 0 matches the DiT two-stage implementation")
     parser.add_argument("--distill_coeff", type=float, default=2.0)
+    parser.add_argument("--attnscaf_loss_type", choices=["kv_mse", "kv_cos"],
+                        default="kv_mse")
 
     # config file (YAML)
     parser.add_argument("--config", type=str, default=None,
@@ -309,6 +313,12 @@ def main(args):
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
 
+    # Evaluation uses the native JiT path only. Training-only encoder and
+    # projection modules are intentionally absent from the deployed model.
+    if args.evaluate_gen:
+        args.enable_repa = False
+        args.enable_attnscaf = False
+
     # Prepare REPA kwargs
     if args.enable_repa or args.enable_attnscaf:
         encoders = load_encoders(
@@ -323,15 +333,26 @@ def main(args):
             "zscore_proj_skip_std": args.zscore_proj_skip_std,
             "kv_extractor": None,
         }
-        # If the script is run for saving generation or evaluation, we don't load the projectors
-        args.z_dims = [encoder.embed_dim for encoder in encoders] if (args.enable_repa and not args.evaluate_gen) else []
-        args.scaffold_dim = encoders[0].embed_dim if (args.enable_attnscaf and not args.evaluate_gen) else 0
+        args.z_dims = [encoder.embed_dim for encoder in encoders] if args.enable_repa else []
+        args.scaffold_dim = encoders[0].embed_dim if args.enable_attnscaf else 0
         args.scaffold_heads = 0
-        if args.enable_attnscaf and not args.evaluate_gen:
+        if args.enable_attnscaf:
             encoder_model = encoders[0].model
             layer_index = args.attnscaf_enc_layer - 1
+            if not hasattr(encoder_model, "blocks"):
+                raise ValueError("AttnScaf requires an encoder with transformer blocks")
+            if layer_index < 0 or layer_index >= len(encoder_model.blocks):
+                raise ValueError(
+                    f"attnscaf_enc_layer must be in 1..{len(encoder_model.blocks)}"
+                )
+            encoder_block = encoder_model.blocks[layer_index]
+            if not hasattr(encoder_block, "attn"):
+                raise ValueError("AttnScaf requires transformer blocks with attention")
+            encoder_attn = encoder_block.attn
+            if not hasattr(encoder_attn, "qkv") or not hasattr(encoder_attn, "num_heads"):
+                raise ValueError("AttnScaf requires a timm/DINO-style qkv attention layer")
             repa_kwargs["kv_extractor"] = EncoderKVExtractor(encoder_model, [layer_index])
-            args.scaffold_heads = encoder_model.blocks[layer_index].attn.num_heads
+            args.scaffold_heads = encoder_attn.num_heads
         print("Z dims:", args.z_dims)
     else:
         repa_kwargs = {
@@ -372,6 +393,7 @@ def main(args):
     print(optimizer)
 
     # Resume from checkpoint if provided
+    global_step = 0
     checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
     if checkpoint_path and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -394,6 +416,10 @@ def main(args):
             # Resume from the next epoch after the one stored in the checkpoint.
             # Here, checkpoint['epoch'] is interpreted as "number of epochs finished".
             args.start_epoch = checkpoint['epoch']
+            checkpoint_args = checkpoint.get('args')
+            global_step = getattr(
+                checkpoint_args, 'global_step', args.start_epoch * len(data_loader_train)
+            )
             print("Loaded optimizer & scaler state!")
         del checkpoint
     else:
@@ -414,16 +440,21 @@ def main(args):
     print("REPA kwargs:", repa_kwargs)
 
     # Training loop
-    print(f"Start training for {args.epochs} epochs")
+    print(f"Start training for {args.epochs} epochs (global step {global_step})")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, repa_kwargs, log_writer=log_writer, args=args)
+        global_step, reached_step_limit = train_one_epoch(
+            model, model_without_ddp, data_loader_train, optimizer, device, epoch,
+            repa_kwargs, log_writer=log_writer, args=args, global_step=global_step,
+        )
+        args.global_step = global_step
 
         # Save final checkpoint periodically for easier resuming
-        if (epoch + 1) % args.save_last_freq == 0 or (epoch + 1) == args.epochs:
+        if ((epoch + 1) % args.save_last_freq == 0
+                or (epoch + 1) == args.epochs or reached_step_limit):
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
@@ -457,6 +488,10 @@ def main(args):
 
         if misc.is_main_process() and log_writer is not None:
             log_writer.flush()
+
+        if reached_step_limit:
+            print(f"Reached max_train_steps={args.max_train_steps}")
+            break
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

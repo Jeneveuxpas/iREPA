@@ -92,6 +92,9 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+def _rms_unit(t, eps=1e-6):
+    """RMS-normalise over the head dim, with no learnable gain."""
+    return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     scale_factor = 1 / math.sqrt(query.size(-1))
@@ -127,6 +130,7 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = self.q_norm(q)
+        k_pre = k                   # pre-norm, gain-free target for the distill loss
         k = self.k_norm(k)          # k: post-norm, pre-RoPE
 
         q_rope = rope(q)
@@ -145,16 +149,26 @@ class Attention(nn.Module):
 
             if distill_scaffold:
                 x = native_x
+                # The consistency loss must not see k_norm's learnable gain w.
+                # Both k and s_k pass through the SAME k_norm, so any loss on
+                # them scales with w: the model can minimise it by shrinking w
+                # instead of aligning anything, which collapses the attention
+                # temperature at this layer.  Compare pre-norm keys on the unit
+                # sphere instead, so w is out of the graph entirely.
+                # More generally: what this interface carries is direction.
+                # Magnitude is each architecture's internal scale (unobservable
+                # in GLA, gameable here) and should not be matched across
+                # branches.
+                k_u = _rms_unit(k_pre.float())
+                s_k_u = _rms_unit(scaffold_k.detach().float())
                 if scaffold_loss_type == "kv_mse":
                     distill_loss = (
-                        F.mse_loss(k.float(), s_k.detach().float())
+                        F.mse_loss(k_u, s_k_u)
                         + F.mse_loss(v.float(), scaffold_v.detach().float())
                     )
                 elif scaffold_loss_type == "kv_cos":
                     distill_loss = (
-                        1.0 - F.cosine_similarity(
-                            k.float(), s_k.detach().float(), dim=-1
-                        ).mean()
+                        1.0 - F.cosine_similarity(k_u, s_k_u, dim=-1).mean()
                         + 1.0 - F.cosine_similarity(
                             v.float(), scaffold_v.detach().float(), dim=-1
                         ).mean()

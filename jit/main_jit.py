@@ -245,7 +245,6 @@ def main(args):
                     id=wandb_run_id,  # None for new runs, existing ID for resumed runs
                     settings=wandb.Settings(
                         init_timeout=300,  # 5 min timeout for slow networks
-                        start_method="thread"
                     )
                 )
                 print(f"WandB online logging initialized: {wandb.run.url}")

@@ -1,14 +1,12 @@
-# AttnScaf-only JiT-B/16 training. DINO K/V scaffold block 4 for the first
-# 20k optimizer steps; the remaining steps use native attention with K/V loss.
+# AttnScaf (scaffold block 4) + REPA (align block 6), JiT-B/16.
 model: JiT-B/16
 img_size: 256
 class_num: 1000
 
-enable_repa: false
 enable_attnscaf: true
+enable_repa: true
 enc_type: dinov2-vit-b
 
-# JiT-B inserts in-context tokens before block 5, so scaffold block 4.
 attnscaf_layer: 4
 attnscaf_enc_layer: 12
 attnscaf_kv_proj: linear
@@ -18,13 +16,12 @@ transition_steps: 0
 distill_coeff: 0.2
 attnscaf_loss_type: kv_cos
 
-max_train_steps: 400000
-# Effective batch is batch_size * world_size, and lr = blr * eff_batch / 256.
-# Pin the batch and let max_train_steps determine the training length.
-batch_size: 128        # 2 GPUs -> effective batch 256, lr 5e-5
-epochs: 200
-
+encoder_depth: 6
 projection_layer_type: mlp
 projection_loss_type: cosine
-proj_coeff: "0.0"
+proj_coeff: "0.5"
 spnorm_method: none
+
+batch_size: 128
+epochs: 200
+max_train_steps: 400000

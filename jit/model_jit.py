@@ -147,44 +147,46 @@ class Attention(nn.Module):
             # compared under identical scale and identical relative geometry.
             s_k = self.k_norm(scaffold_k)
 
+            # Past in_context_start, JiT's sequence carries n_ctx class tokens
+            # in front of the patch grid, while the encoder only supplies K/V
+            # for the patches.  For the injection path, keep the native K/V at
+            # those leading positions so queries can still read the class
+            # condition; the loss below stays on the patch positions only.
+            n_pat = scaffold_k.shape[2]
+            n_ctx = k.shape[2] - n_pat
+            if n_ctx > 0:
+                s_k_full = torch.cat([k[:, :, :n_ctx].detach(), s_k], dim=2)
+                s_v_full = torch.cat([v[:, :, :n_ctx].detach(), scaffold_v], dim=2)
+            else:
+                s_k_full, s_v_full = s_k, scaffold_v
+
             if distill_scaffold:
                 x = native_x
-                # The consistency loss must not see k_norm's learnable gain w.
-                # Both k and s_k pass through the SAME k_norm, so any loss on
-                # them scales with w: the model can minimise it by shrinking w
-                # instead of aligning anything, which collapses the attention
-                # temperature at this layer.  Compare pre-norm keys on the unit
-                # sphere instead, so w is out of the graph entirely.
-                # More generally: what this interface carries is direction.
-                # Magnitude is each architecture's internal scale (unobservable
-                # in GLA, gameable here) and should not be matched across
-                # branches.
-                k_u = _rms_unit(k_pre.float())
+                k_u = _rms_unit(k_pre[:, :, -n_pat:].float())
+                v_pat = v[:, :, -n_pat:]
                 s_k_u = _rms_unit(scaffold_k.detach().float())
                 if scaffold_loss_type == "kv_mse":
                     distill_loss = (
                         F.mse_loss(k_u, s_k_u)
-                        + F.mse_loss(v.float(), scaffold_v.detach().float())
+                        + F.mse_loss(v_pat.float(), scaffold_v.detach().float())
                     )
                 elif scaffold_loss_type == "kv_cos":
                     distill_loss = (
                         1.0 - F.cosine_similarity(k_u, s_k_u, dim=-1).mean()
                         + 1.0 - F.cosine_similarity(
-                            v.float(), scaffold_v.detach().float(), dim=-1
+                            v_pat.float(), scaffold_v.detach().float(), dim=-1
                         ).mean()
                     )
                 else:
                     raise ValueError(
                         f"Unknown AttnScaf loss type: {scaffold_loss_type}"
                     )
-                # Keep the training-only projection in the graph under DDP even
-                # though the encoder target must not receive gradients.
                 distill_loss = distill_loss + 0.0 * (
                     scaffold_k.sum() + scaffold_v.sum()
                 )
             else:
                 scaffold_x = scaled_dot_product_attention(
-                    q_rope, rope(s_k), scaffold_v,
+                    q_rope, rope(s_k_full), s_v_full,
                     dropout_p=self.attn_drop.p if self.training else 0.,
                 )
                 alpha = torch.as_tensor(
@@ -461,10 +463,7 @@ class JiT(nn.Module):
             block_k = block_v = None
             if projected_kv is not None and (i + 1) == self.attnscaf_layer:
                 block_k, block_v = projected_kv[0]
-            if block_k is not None and x.shape[1] != block_k.shape[2]:
-                raise ValueError(
-                    "AttnScaf must be injected before JiT in-context tokens are inserted"
-                )
+
             x, block_distill = block(
                 x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext,
                 scaffold_k=block_k, scaffold_v=block_v, scaffold_alpha=scaffold_alpha,

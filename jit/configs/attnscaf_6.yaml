@@ -18,7 +18,7 @@ transition_steps: 0
 distill_coeff: 0.2
 attnscaf_loss_type: kv_cos
 
-max_train_steps: 200000
+max_train_steps: 400000
 # Effective batch is batch_size * world_size, and lr = blr * eff_batch / 256.
 # Pin the batch and let max_train_steps determine the training length.
 batch_size: 128        # 2 GPUs -> effective batch 256, lr 5e-5

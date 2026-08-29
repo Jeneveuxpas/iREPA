@@ -24,4 +24,4 @@ spnorm_method: none
 
 batch_size: 128
 epochs: 200
-max_train_steps: 400000
+max_train_steps: 100000

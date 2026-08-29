@@ -19,7 +19,7 @@ attnscaf_loss_type: kv_cos
 encoder_depth: 6
 projection_layer_type: mlp
 projection_loss_type: cosine
-proj_coeff: "0.5"
+proj_coeff: "0.1"
 spnorm_method: none
 
 batch_size: 128

@@ -121,6 +121,8 @@ def get_args_parser():
                         help='Experiment name (used for wandb run name)')
     parser.add_argument('--resume', default='',
                         help='Folder that contains checkpoint to resume from')
+    parser.add_argument('--ckpt_name', default='checkpoint-last.pth', type=str,
+                        help='checkpoint file name inside --resume dir')
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--log_freq', default=100, type=int)
@@ -393,7 +395,7 @@ def main(args):
 
     # Resume from checkpoint if provided
     global_step = 0
-    checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
+    checkpoint_path = os.path.join(args.resume, args.ckpt_name) if args.resume else None
     if checkpoint_path and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)

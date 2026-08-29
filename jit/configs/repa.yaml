@@ -1,7 +1,20 @@
-# REPA configuration (original)
-# Usage: torchrun main_jit.py --config configs/repa.yaml ...
+# REPA-only baseline for JiT-B/16, aligning at block 6.
+# Matches the REPA settings in attnscaf.yaml (the AttnScaf+REPA combo) exactly,
+# so the combo's gain over this run is attributable to AttnScaf alone.
+model: JiT-B/16
+img_size: 256
+class_num: 1000
 
+enable_attnscaf: false
+enable_repa: true
+enc_type: dinov2-vit-b
+
+encoder_depth: 6
 projection_layer_type: mlp
+projection_loss_type: cosine
 proj_coeff: "0.5"
 spnorm_method: none
-enable_repa: true
+
+batch_size: 128
+epochs: 200
+max_train_steps: 100000

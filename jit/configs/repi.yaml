@@ -1,0 +1,31 @@
+# AttnScaf standalone. DINO K/V temporarily scaffold JiT block 8; after 20k
+# steps JiT uses native attention and aligns its K/V to the frozen encoder K/V.
+model: JiT-L/16
+img_size: 256
+class_num: 1000
+
+enable_repa: false
+enable_attnscaf: true
+enc_type: dinov2-vit-b
+
+projection_layer_type: mlp
+projection_loss_type: cosine
+proj_coeff: "0.0"
+spnorm_method: none
+zscore_alpha: 0.6
+# Effective batch is batch_size * world_size, and lr = blr * eff_batch / 256.
+# Pin the batch and let max_train_steps determine the training length.
+batch_size: 128        # 2 GPUs -> effective batch 256, lr 5e-5
+epochs: 200
+max_train_steps: 400000
+
+# 0--20k: encoder K/V attention; >=20k: native attention plus K/V alignment.
+encoder_depth: 8
+attnscaf_layer: 8
+attnscaf_enc_layer: 12
+attnscaf_kv_proj: linear
+attnscaf_kv_norm: none
+stage1_steps: 20000
+transition_steps: 0
+distill_coeff: 0.2
+attnscaf_loss_type: kv_cos

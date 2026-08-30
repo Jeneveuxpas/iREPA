@@ -27,5 +27,5 @@ attnscaf_kv_proj: linear
 attnscaf_kv_norm: none
 stage1_steps: 20000
 transition_steps: 0
-distill_coeff: 2.0
-attnscaf_loss_type: kv_mse
+distill_coeff: 0.2
+attnscaf_loss_type: kv_cos

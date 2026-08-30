@@ -4,7 +4,7 @@ model: JiT-L/16
 img_size: 256
 class_num: 1000
 
-enable_repa: false
+enable_repa: true
 enable_attnscaf: true
 enc_type: dinov2-vit-b
 

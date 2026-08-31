@@ -1,0 +1,30 @@
+# JiT-B/16: AttnScaf/K-V alignment at block 6, plus weak REPA at block 8.
+# The first 20k steps use DINO K/V as an attention scaffold.  Afterwards, JiT
+# returns to native attention and aligns its K/V while REPA stays enabled.
+model: JiT-B/16
+img_size: 256
+class_num: 1000
+
+enable_repa: true
+enable_attnscaf: true
+enc_type: dinov2-vit-b
+
+attnscaf_layer: 6
+attnscaf_enc_layer: 12
+attnscaf_kv_proj: linear
+attnscaf_kv_norm: none
+stage1_steps: 20000
+transition_steps: 0
+distill_coeff: 0.2
+attnscaf_loss_type: kv_cos
+
+# Align JiT patch tokens after block 8 with a small REPA weight.
+encoder_depth: 8
+projection_layer_type: mlp
+projection_loss_type: cosine
+proj_coeff: "0.05"
+spnorm_method: none
+
+max_train_steps: 400000
+batch_size: 128
+epochs: 200

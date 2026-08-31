@@ -1,6 +1,6 @@
 # AttnScaf standalone. DINO K/V temporarily scaffold JiT block 8; after 20k
 # steps JiT uses native attention and aligns its K/V to the frozen encoder K/V.
-model: JiT-L/16
+model: JiT-B/16
 img_size: 256
 class_num: 1000
 
@@ -17,10 +17,10 @@ zscore_alpha: 0.6
 # Pin the batch and let max_train_steps determine the training length.
 batch_size: 128        # 2 GPUs -> effective batch 256, lr 5e-5
 epochs: 200
-max_train_steps: 400000
+max_train_steps: 100000
 
 # 0--20k: encoder K/V attention; >=20k: native attention plus K/V alignment.
-encoder_depth: 8
+encoder_depth: 6
 attnscaf_layer: 6
 attnscaf_enc_layer: 12
 attnscaf_kv_proj: linear

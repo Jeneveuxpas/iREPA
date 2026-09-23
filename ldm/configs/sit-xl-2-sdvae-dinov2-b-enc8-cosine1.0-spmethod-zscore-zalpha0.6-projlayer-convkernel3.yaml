@@ -28,7 +28,7 @@ vis_enc_resolution: 256
 allow_tf32: true
 mixed_precision: bf16
 epochs: 1400
-max_train_steps: 1000000
+max_train_steps: 100000
 checkpointing_steps: 50000
 gradient_accumulation_steps: 1
 learning_rate: 0.0001
